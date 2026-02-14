@@ -1,0 +1,12 @@
+.venv/
+.conda/
+__pycache__/
+*.pyc
+
+rhymes.db
+
+.DS_Store
+
+*.tmp
+*.swp
+*.swo
