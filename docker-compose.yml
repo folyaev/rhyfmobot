@@ -1,0 +1,12 @@
+services:
+  rhyfmo-bot:
+    build: .
+    container_name: rhyfmo-bot
+    restart: unless-stopped
+    init: true
+    environment:
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      DATA_DIR: /data
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/data

@@ -8,6 +8,7 @@ Telegram-бот для сбора, хранения и просмотра риф
 - принимает рифмы (через запятую) и сохраняет их в `rhymes.db`;
 - позволяет добавить своё слово;
 - показывает рифмы по команде `/r <слово>`;
+- показывает статистику базы по команде `/stats`;
 - поддерживает редактирование рифм через кнопку в интерфейсе.
 
 ## Структура
@@ -24,7 +25,7 @@ Telegram-бот для сбора, хранения и просмотра риф
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install python-telegram-bot aiosqlite
+pip install -r requirements.txt
 ```
 
 2. Указать токен Telegram-бота через переменную окружения:
@@ -39,11 +40,59 @@ export API_TOKEN="ваш_токен_из_BotFather"
 python bot.py
 ```
 
+## Запуск в Docker (фон + автостарт)
+
+1. Подготовить `.env` с токеном:
+
+```bash
+cp .env.example .env
+# отредактируйте .env и укажите API_TOKEN
+```
+
+2. Собрать и запустить контейнер в фоне:
+
+```bash
+docker compose up -d --build
+```
+
+3. Проверка статуса и логов:
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+4. Остановка/запуск:
+
+```bash
+docker compose stop
+docker compose start
+```
+
+`docker-compose.yml` уже содержит `restart: unless-stopped`, поэтому бот автоматически поднимется после перезапуска Docker/сервера. Данные (`words.txt`, `rhymes.db`) хранятся в локальной папке `data`.
+
 ## Команды в Telegram
 
 - `/start` - начать работу;
 - `/help` - показать справку;
-- `/r <слово>` - показать сохранённые рифмы к слову.
+- `/r <слово>` - показать сохранённые рифмы к слову;
+- `/stats` - показать число слов и связей между ними.
+
+## Резервная копия БД
+
+Создать консистентную копию SQLite-базы:
+
+```bash
+python backup_db.py
+```
+
+По умолчанию копия сохраняется в папку `data/backups`.
+
+## Тесты
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Как хранятся рифмы
 
