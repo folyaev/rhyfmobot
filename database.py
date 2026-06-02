@@ -34,6 +34,16 @@ class RhymesRepository:
                 )
                 '''
             )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS challenge_subscriptions (
+                    chat_id INTEGER PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    next_send_at TEXT NOT NULL,
+                    last_sent_at TEXT
+                )
+                '''
+            )
 
     def get_rhymes(self, word):
         with self._connect() as conn:
@@ -46,10 +56,116 @@ class RhymesRepository:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(DISTINCT word), COUNT(*) FROM rhymes')
             words_count, links_count = cursor.fetchone()
+            cursor.execute(
+                'SELECT COUNT(*) FROM challenge_subscriptions WHERE enabled = 1'
+            )
+            subscribers_count = cursor.fetchone()[0]
             return {
                 'words_count': words_count,
                 'links_count': links_count,
+                'subscribers_count': subscribers_count,
             }
+
+    def get_rhyme_counts(self, words):
+        unique_words = list(dict.fromkeys(words))
+        if not unique_words:
+            return {}
+        placeholders = ','.join('?' for _ in unique_words)
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'''
+                SELECT word, COUNT(*)
+                FROM rhymes
+                WHERE word IN ({placeholders})
+                GROUP BY word
+                ''',
+                unique_words,
+            )
+            counts = dict(cursor.fetchall())
+        return {word: counts.get(word, 0) for word in unique_words}
+
+    def subscribe_to_challenges(self, chat_id, next_send_at):
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO challenge_subscriptions (chat_id, enabled, next_send_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    enabled = 1,
+                    next_send_at = excluded.next_send_at
+                ''',
+                (chat_id, next_send_at),
+            )
+
+    def ensure_challenge_subscription(self, chat_id, next_send_at):
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT OR IGNORE INTO challenge_subscriptions (
+                    chat_id,
+                    enabled,
+                    next_send_at
+                )
+                VALUES (?, 1, ?)
+                ''',
+                (chat_id, next_send_at),
+            )
+
+    def unsubscribe_from_challenges(self, chat_id):
+        with self._connect() as conn:
+            conn.execute(
+                'UPDATE challenge_subscriptions SET enabled = 0 WHERE chat_id = ?',
+                (chat_id,),
+            )
+
+    def get_challenge_subscription(self, chat_id):
+        with self._connect() as conn:
+            cursor = conn.execute(
+                '''
+                SELECT chat_id, enabled, next_send_at, last_sent_at
+                FROM challenge_subscriptions
+                WHERE chat_id = ?
+                ''',
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            'chat_id': row[0],
+            'enabled': bool(row[1]),
+            'next_send_at': row[2],
+            'last_sent_at': row[3],
+        }
+
+    def get_due_challenge_subscriptions(self, now, limit=100):
+        with self._connect() as conn:
+            cursor = conn.execute(
+                '''
+                SELECT chat_id, next_send_at
+                FROM challenge_subscriptions
+                WHERE enabled = 1 AND next_send_at <= ?
+                ORDER BY next_send_at
+                LIMIT ?
+                ''',
+                (now, limit),
+            )
+            return [
+                {'chat_id': row[0], 'next_send_at': row[1]}
+                for row in cursor.fetchall()
+            ]
+
+    def mark_challenge_sent(self, chat_id, sent_at, next_send_at):
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                UPDATE challenge_subscriptions
+                SET last_sent_at = ?, next_send_at = ?
+                WHERE chat_id = ?
+                ''',
+                (sent_at, next_send_at, chat_id),
+            )
 
     def backup(self, backup_path):
         backup_path = Path(backup_path)

@@ -39,7 +39,79 @@ class RhymesRepositoryTest(unittest.TestCase):
 
         self.assertEqual(
             self.repository.get_stats(),
-            {'words_count': 3, 'links_count': 6},
+            {'words_count': 3, 'links_count': 6, 'subscribers_count': 0},
+        )
+
+    def test_challenge_subscription_lifecycle(self):
+        self.repository.subscribe_to_challenges(123, '2026-06-01T08:00:00+00:00')
+
+        self.assertEqual(
+            self.repository.get_due_challenge_subscriptions(
+                '2026-06-01T08:00:00+00:00'
+            ),
+            [{'chat_id': 123, 'next_send_at': '2026-06-01T08:00:00+00:00'}],
+        )
+        self.repository.mark_challenge_sent(
+            123,
+            '2026-06-01T08:00:00+00:00',
+            '2026-06-02T09:00:00+00:00',
+        )
+        self.assertEqual(
+            self.repository.get_challenge_subscription(123),
+            {
+                'chat_id': 123,
+                'enabled': True,
+                'next_send_at': '2026-06-02T09:00:00+00:00',
+                'last_sent_at': '2026-06-01T08:00:00+00:00',
+            },
+        )
+        self.repository.unsubscribe_from_challenges(123)
+        self.assertFalse(
+            self.repository.get_challenge_subscription(123)['enabled']
+        )
+
+    def test_default_challenge_subscription_is_created_once(self):
+        self.repository.ensure_challenge_subscription(
+            123,
+            '2026-06-01T08:00:00+00:00',
+        )
+        self.repository.ensure_challenge_subscription(
+            123,
+            '2026-06-02T09:00:00+00:00',
+        )
+
+        self.assertEqual(
+            self.repository.get_challenge_subscription(123),
+            {
+                'chat_id': 123,
+                'enabled': True,
+                'next_send_at': '2026-06-01T08:00:00+00:00',
+                'last_sent_at': None,
+            },
+        )
+
+    def test_default_challenge_subscription_does_not_reenable_opted_out_chat(self):
+        self.repository.ensure_challenge_subscription(
+            123,
+            '2026-06-01T08:00:00+00:00',
+        )
+        self.repository.unsubscribe_from_challenges(123)
+
+        self.repository.ensure_challenge_subscription(
+            123,
+            '2026-06-02T09:00:00+00:00',
+        )
+
+        self.assertFalse(
+            self.repository.get_challenge_subscription(123)['enabled']
+        )
+
+    def test_get_rhyme_counts_includes_words_without_rhymes(self):
+        self.repository.add_rhyme_group('вдруг', ['друг'])
+
+        self.assertEqual(
+            self.repository.get_rhyme_counts(['вдруг', 'друг', 'круг']),
+            {'вдруг': 1, 'друг': 1, 'круг': 0},
         )
 
     def test_backup_creates_readable_copy(self):

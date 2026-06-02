@@ -8,5 +8,8 @@ services:
       API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
       DATA_DIR: /data
       LOG_LEVEL: INFO
+      CHALLENGE_TIMEZONE: Europe/Simferopol
+      CHALLENGE_START_HOUR: 10
+      CHALLENGE_END_HOUR: 21
     volumes:
       - ./data:/data

@@ -1,11 +1,14 @@
+import asyncio
 import random
 import os
 import logging
 import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from database import RhymesRepository
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import NetworkError, TimedOut
+from telegram.error import Forbidden, NetworkError, TimedOut
 from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     CallbackQueryHandler,
+    TypeHandler,
     filters,
 )
 
@@ -39,8 +43,19 @@ DB_PATH = Path(os.getenv('DB_PATH', str(DATA_DIR / 'rhymes.db')))
 WORDS_PATH = Path(os.getenv('WORDS_PATH', str(DATA_DIR / 'words.txt')))
 SOURCE_WORDS_PATH = BASE_DIR / 'words.txt'
 MAX_WORD_LENGTH = int(os.getenv('MAX_WORD_LENGTH', '64'))
+CHALLENGE_TIMEZONE_NAME = os.getenv('CHALLENGE_TIMEZONE', 'Europe/Simferopol')
+CHALLENGE_START_HOUR = int(os.getenv('CHALLENGE_START_HOUR', '10'))
+CHALLENGE_END_HOUR = int(os.getenv('CHALLENGE_END_HOUR', '21'))
+CHALLENGE_SAMPLE_SIZE = int(os.getenv('CHALLENGE_SAMPLE_SIZE', '100'))
+CHALLENGE_POLL_SECONDS = int(os.getenv('CHALLENGE_POLL_SECONDS', '60'))
 DEFAULT_WORDS = 'море\nгора\nлес\nзвезда\nлуна\n'
 RHYMES_REPOSITORY = RhymesRepository(DB_PATH)
+
+try:
+    CHALLENGE_TIMEZONE = ZoneInfo(CHALLENGE_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    logger.warning("Часовой пояс %s не найден, используется UTC", CHALLENGE_TIMEZONE_NAME)
+    CHALLENGE_TIMEZONE = timezone.utc
 
 def get_api_token():
     token = os.getenv('API_TOKEN')
@@ -123,6 +138,97 @@ def get_rhymes_prompt(word):
         "Введите рифмы к этому слову, разделяя их запятыми."
     )
 
+def get_next_challenge_at(now=None, start_from_tomorrow=False):
+    now = now or datetime.now(timezone.utc)
+    local_now = now.astimezone(CHALLENGE_TIMEZONE)
+    day_offset = 1 if start_from_tomorrow else 0
+    while True:
+        day = (local_now + timedelta(days=day_offset)).date()
+        start = datetime.combine(
+            day,
+            datetime.min.time(),
+            tzinfo=CHALLENGE_TIMEZONE,
+        ).replace(hour=CHALLENGE_START_HOUR)
+        end = start.replace(hour=CHALLENGE_END_HOUR)
+        candidate = start + timedelta(
+            seconds=random.randint(0, int((end - start).total_seconds()))
+        )
+        if candidate > local_now:
+            return candidate.astimezone(timezone.utc)
+        day_offset += 1
+
+def get_challenge_word():
+    if not words_list:
+        return None
+    sample_size = min(CHALLENGE_SAMPLE_SIZE, len(words_list))
+    candidates = random.sample(words_list, sample_size)
+    rhyme_counts = RHYMES_REPOSITORY.get_rhyme_counts(candidates)
+    minimum_count = min(rhyme_counts.values())
+    return random.choice([
+        word for word, count in rhyme_counts.items() if count == minimum_count
+    ])
+
+def get_challenge_markup(word):
+    callback_data = f'challenge_word:{word}'
+    if len(callback_data.encode('utf-8')) > 64:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('✍️ Срифмовать', callback_data=callback_data)],
+    ])
+
+async def send_challenge(bot, chat_id):
+    word = get_challenge_word()
+    if word is None:
+        logger.warning("Не удалось отправить челлендж: список слов пуст")
+        return
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🎯 Дневной рифмо-челлендж\n\n"
+            f"Придумайте рифмы к слову: {word}"
+        ),
+        reply_markup=get_challenge_markup(word),
+    )
+
+async def challenge_worker(application):
+    while True:
+        now = datetime.now(timezone.utc)
+        due_subscriptions = RHYMES_REPOSITORY.get_due_challenge_subscriptions(
+            now.isoformat()
+        )
+        for subscription in due_subscriptions:
+            chat_id = subscription['chat_id']
+            next_send_at = get_next_challenge_at(now, start_from_tomorrow=True)
+            try:
+                await send_challenge(application.bot, chat_id)
+            except Forbidden:
+                logger.info("Отключаю челленджи для недоступного чата %s", chat_id)
+                RHYMES_REPOSITORY.unsubscribe_from_challenges(chat_id)
+                continue
+            except Exception:
+                logger.exception("Не удалось отправить челлендж в чат %s", chat_id)
+            RHYMES_REPOSITORY.mark_challenge_sent(
+                chat_id,
+                now.isoformat(),
+                next_send_at.isoformat(),
+            )
+        await asyncio.sleep(CHALLENGE_POLL_SECONDS)
+
+async def post_init(application):
+    application.create_task(challenge_worker(application))
+
+async def ensure_default_challenge_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.effective_chat is None:
+        return
+    next_send_at = get_next_challenge_at()
+    RHYMES_REPOSITORY.ensure_challenge_subscription(
+        update.effective_chat.id,
+        next_send_at.isoformat(),
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Добро пожаловать! Выберите действие:",
@@ -170,6 +276,19 @@ async def new_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # Сохраняем идентификатор сообщения
+    context.user_data['bot_message_id'] = sent_message.message_id
+    return CHOOSING_RHYMES
+
+async def accept_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    word = query.data.removeprefix('challenge_word:')
+    context.user_data['chosen_word'] = word
+    sent_message = await query.message.reply_text(
+        get_rhymes_prompt(word),
+        parse_mode='Markdown',
+        reply_markup=get_word_actions(),
+    )
     context.user_data['bot_message_id'] = sent_message.message_id
     return CHOOSING_RHYMES
 
@@ -425,8 +544,50 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Статистика базы рифм:\n"
         f"Слов с сохранёнными связями: {stats['words_count']}\n"
-        f"Связей между словами: {stats['links_count']}"
+        f"Связей между словами: {stats['links_count']}\n"
+        f"Подписчиков на челленджи: {stats['subscribers_count']}"
     )
+
+
+async def challenge_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    next_send_at = get_next_challenge_at()
+    RHYMES_REPOSITORY.subscribe_to_challenges(
+        update.effective_chat.id,
+        next_send_at.isoformat(),
+    )
+    await update.message.reply_text(
+        "Дневные рифмо-челленджи включены.\n"
+        f"Следующий придёт {format_challenge_time(next_send_at)}."
+    )
+
+
+async def challenge_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    RHYMES_REPOSITORY.unsubscribe_from_challenges(update.effective_chat.id)
+    await update.message.reply_text("Дневные рифмо-челленджи отключены.")
+
+
+async def challenge_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subscription = RHYMES_REPOSITORY.get_challenge_subscription(
+        update.effective_chat.id
+    )
+    if subscription is None or not subscription['enabled']:
+        await update.message.reply_text(
+            "Дневные рифмо-челленджи отключены. Включить: /challenge_on"
+        )
+        return
+    next_send_at = datetime.fromisoformat(subscription['next_send_at'])
+    await update.message.reply_text(
+        "Дневные рифмо-челленджи включены.\n"
+        f"Следующий придёт {format_challenge_time(next_send_at)}."
+    )
+
+
+async def challenge_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_challenge(context.bot, update.effective_chat.id)
+
+
+def format_challenge_time(value):
+    return value.astimezone(CHALLENGE_TIMEZONE).strftime('%d.%m.%Y в %H:%M')
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,6 +597,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - показать это сообщение\n"
         "/r <слово> - показать рифмы к указанному слову\n"
         "/stats - показать статистику базы рифм\n"
+        "/challenge_on - включить дневные рифмо-челленджи\n"
+        "/challenge_off - отключить дневные рифмо-челленджи\n"
+        "/challenge_status - показать статус челленджей\n"
+        "/challenge_now - получить челлендж прямо сейчас\n"
     )
     await update.message.reply_text(help_text, reply_markup=get_main_menu())
 
@@ -449,6 +614,7 @@ def main():
         .read_timeout(20)
         .write_timeout(20)
         .pool_timeout(20)
+        .post_init(post_init)
         .build()
     )
 
@@ -457,6 +623,7 @@ def main():
         entry_points=[
             CallbackQueryHandler(new_word, pattern='^new_word$'),
             CallbackQueryHandler(input_word, pattern='^input_word$'),
+            CallbackQueryHandler(accept_challenge, pattern='^challenge_word:'),
         ],
         states={
             CHOOSING_RHYMES: [
@@ -486,10 +653,18 @@ def main():
         fallbacks=[],
     )
 
+    application.add_handler(
+        TypeHandler(Update, ensure_default_challenge_subscription),
+        group=-1,
+    )
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('r', show_rhymes))  # Обновлено
     application.add_handler(CommandHandler('stats', stats_command))
+    application.add_handler(CommandHandler('challenge_on', challenge_on_command))
+    application.add_handler(CommandHandler('challenge_off', challenge_off_command))
+    application.add_handler(CommandHandler('challenge_status', challenge_status_command))
+    application.add_handler(CommandHandler('challenge_now', challenge_now_command))
     application.add_handler(conv_handler)
     application.add_handler(edit_rhymes_conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
