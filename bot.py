@@ -8,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from database import RhymesRepository
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     ApplicationBuilder,
@@ -46,8 +46,10 @@ MAX_WORD_LENGTH = int(os.getenv('MAX_WORD_LENGTH', '64'))
 CHALLENGE_TIMEZONE_NAME = os.getenv('CHALLENGE_TIMEZONE', 'Europe/Simferopol')
 CHALLENGE_START_HOUR = int(os.getenv('CHALLENGE_START_HOUR', '10'))
 CHALLENGE_END_HOUR = int(os.getenv('CHALLENGE_END_HOUR', '21'))
+CHALLENGES_PER_DAY = int(os.getenv('CHALLENGES_PER_DAY', '3'))
 CHALLENGE_SAMPLE_SIZE = int(os.getenv('CHALLENGE_SAMPLE_SIZE', '100'))
 CHALLENGE_POLL_SECONDS = int(os.getenv('CHALLENGE_POLL_SECONDS', '60'))
+TECHNICAL_MESSAGE_TTL_SECONDS = int(os.getenv('TECHNICAL_MESSAGE_TTL_SECONDS', '600'))
 DEFAULT_WORDS = 'море\nгора\nлес\nзвезда\nлуна\n'
 RHYMES_REPOSITORY = RhymesRepository(DB_PATH)
 
@@ -114,6 +116,28 @@ def add_words_to_file(words):
                 f.write(word + '\n')
         words_list.extend(new_words)
 
+
+async def delete_technical_message_after_delay(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id,
+    message_id,
+    delay_seconds,
+    user_data_key,
+):
+    await asyncio.sleep(delay_seconds)
+    if context.user_data.get(user_data_key) != message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except BadRequest:
+        return
+    except Exception as e:
+        logger.warning("Не удалось удалить техническое сообщение: %s", e)
+        return
+
+    if context.user_data.get(user_data_key) == message_id:
+        context.user_data.pop(user_data_key, None)
+
 def get_main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('🎲 Новое слово', callback_data='new_word')],
@@ -138,10 +162,11 @@ def get_rhymes_prompt(word):
         "Введите рифмы к этому слову, разделяя их запятыми."
     )
 
-def get_next_challenge_at(now=None, start_from_tomorrow=False):
+def get_next_challenge_at(now=None, start_from_tomorrow=False, skip_current_slot=False):
     now = now or datetime.now(timezone.utc)
     local_now = now.astimezone(CHALLENGE_TIMEZONE)
     day_offset = 1 if start_from_tomorrow else 0
+    challenges_per_day = max(1, CHALLENGES_PER_DAY)
     while True:
         day = (local_now + timedelta(days=day_offset)).date()
         start = datetime.combine(
@@ -150,11 +175,22 @@ def get_next_challenge_at(now=None, start_from_tomorrow=False):
             tzinfo=CHALLENGE_TIMEZONE,
         ).replace(hour=CHALLENGE_START_HOUR)
         end = start.replace(hour=CHALLENGE_END_HOUR)
-        candidate = start + timedelta(
-            seconds=random.randint(0, int((end - start).total_seconds()))
-        )
-        if candidate > local_now:
-            return candidate.astimezone(timezone.utc)
+        window_seconds = int((end - start).total_seconds())
+        slot_seconds = max(1, window_seconds // challenges_per_day)
+        for slot_index in range(challenges_per_day):
+            slot_start = start + timedelta(seconds=slot_index * slot_seconds)
+            if slot_index == challenges_per_day - 1:
+                slot_end = end
+            else:
+                slot_end = start + timedelta(seconds=(slot_index + 1) * slot_seconds)
+            if skip_current_slot and slot_start <= local_now <= slot_end:
+                continue
+            slot_duration = max(0, int((slot_end - slot_start).total_seconds()))
+            candidate = slot_start + timedelta(
+                seconds=random.randint(0, slot_duration)
+            )
+            if candidate > local_now:
+                return candidate.astimezone(timezone.utc)
         day_offset += 1
 
 def get_challenge_word():
@@ -173,7 +209,10 @@ def get_challenge_markup(word):
     if len(callback_data.encode('utf-8')) > 64:
         return None
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton('✍️ Срифмовать', callback_data=callback_data)],
+        [
+            InlineKeyboardButton('✍️ Принять', callback_data=callback_data),
+            InlineKeyboardButton('Отклонить', callback_data='decline_challenge'),
+        ],
     ])
 
 async def send_challenge(bot, chat_id):
@@ -198,7 +237,7 @@ async def challenge_worker(application):
         )
         for subscription in due_subscriptions:
             chat_id = subscription['chat_id']
-            next_send_at = get_next_challenge_at(now, start_from_tomorrow=True)
+            next_send_at = get_next_challenge_at(now, skip_current_slot=True)
             try:
                 await send_challenge(application.bot, chat_id)
             except Forbidden:
@@ -223,11 +262,21 @@ async def ensure_default_challenge_subscription(
 ):
     if update.effective_chat is None:
         return
+    if update.callback_query is not None:
+        return
+    ensured_chats = context.application.bot_data.setdefault(
+        'default_challenge_subscriptions_ensured',
+        set(),
+    )
+    chat_id = update.effective_chat.id
+    if chat_id in ensured_chats:
+        return
     next_send_at = get_next_challenge_at()
     RHYMES_REPOSITORY.ensure_challenge_subscription(
-        update.effective_chat.id,
+        chat_id,
         next_send_at.isoformat(),
     )
+    ensured_chats.add(chat_id)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -240,6 +289,8 @@ async def new_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
         chat_id = query.message.chat_id
+        if context.user_data.get('next_action_message_id') == query.message.message_id:
+            context.user_data.pop('next_action_message_id', None)
     else:
         chat_id = update.effective_chat.id
 
@@ -284,13 +335,31 @@ async def accept_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     word = query.data.removeprefix('challenge_word:')
     context.user_data['chosen_word'] = word
-    sent_message = await query.message.reply_text(
+    sent_message = await query.edit_message_text(
         get_rhymes_prompt(word),
         parse_mode='Markdown',
         reply_markup=get_word_actions(),
     )
     context.user_data['bot_message_id'] = sent_message.message_id
+    context.user_data['challenge_message_id'] = sent_message.message_id
     return CHOOSING_RHYMES
+
+
+async def decline_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sent_message = await query.edit_message_text("Челлендж пропущен.")
+    context.user_data['challenge_status_message_id'] = sent_message.message_id
+    context.application.create_task(
+        delete_technical_message_after_delay(
+            context,
+            query.message.chat_id,
+            sent_message.message_id,
+            TECHNICAL_MESSAGE_TTL_SECONDS,
+            'challenge_status_message_id',
+        )
+    )
+    return ConversationHandler.END
 
 async def next_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -368,6 +437,19 @@ async def input_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     # Удаляем предыдущее сообщение, если необходимо
+    next_action_message_id = context.user_data.get('next_action_message_id')
+    if next_action_message_id == query.message.message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=next_action_message_id,
+            )
+        except BadRequest:
+            pass
+        except Exception as e:
+            logger.warning("Не удалось удалить техническое сообщение: %s", e)
+        context.user_data.pop('next_action_message_id', None)
+
     bot_message_id = context.user_data.get('bot_message_id')
     if bot_message_id:
         try:
@@ -425,6 +507,33 @@ async def receive_rhymes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Удаляем предыдущее сообщение бота
         bot_message_id = context.user_data.get('bot_message_id')
+        challenge_message_id = context.user_data.get('challenge_message_id')
+        if bot_message_id and bot_message_id == challenge_message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=bot_message_id,
+                    text="✨ Спасибо! Ваши рифмы сохранены.\n\nЧто дальше?",
+                    reply_markup=get_main_menu(),
+                )
+                context.user_data['next_action_message_id'] = bot_message_id
+                context.application.create_task(
+                    delete_technical_message_after_delay(
+                        context,
+                        update.effective_chat.id,
+                        bot_message_id,
+                        TECHNICAL_MESSAGE_TTL_SECONDS,
+                        'next_action_message_id',
+                    )
+                )
+                context.user_data.pop('bot_message_id', None)
+                context.user_data.pop('challenge_message_id', None)
+                add_words_to_file(rhymes)
+                context.user_data.pop('chosen_word', None)
+                return ConversationHandler.END
+            except Exception as e:
+                logger.warning("Не удалось отредактировать сообщение челленджа: %s", e)
+
         if bot_message_id:
             try:
                 await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=bot_message_id)
@@ -437,9 +546,28 @@ async def receive_rhymes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✨ Спасибо! Ваши рифмы сохранены.\nВы можете выбрать дальнейшее действие."
         )
         context.user_data['thank_you_message_id'] = thank_you_message.message_id
+        context.application.create_task(
+            delete_technical_message_after_delay(
+                context,
+                update.effective_chat.id,
+                thank_you_message.message_id,
+                TECHNICAL_MESSAGE_TTL_SECONDS,
+                'thank_you_message_id',
+            )
+        )
 
         # Предлагаем дальнейшие действия
-        await update.message.reply_text("Что дальше?", reply_markup=get_main_menu())
+        next_action_message = await update.message.reply_text("Что дальше?", reply_markup=get_main_menu())
+        context.user_data['next_action_message_id'] = next_action_message.message_id
+        context.application.create_task(
+            delete_technical_message_after_delay(
+                context,
+                update.effective_chat.id,
+                next_action_message.message_id,
+                TECHNICAL_MESSAGE_TTL_SECONDS,
+                'next_action_message_id',
+            )
+        )
 
         add_words_to_file(rhymes)
         context.user_data.pop('chosen_word', None)
@@ -624,6 +752,7 @@ def main():
             CallbackQueryHandler(new_word, pattern='^new_word$'),
             CallbackQueryHandler(input_word, pattern='^input_word$'),
             CallbackQueryHandler(accept_challenge, pattern='^challenge_word:'),
+            CallbackQueryHandler(decline_challenge, pattern='^decline_challenge$'),
         ],
         states={
             CHOOSING_RHYMES: [

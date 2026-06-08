@@ -101,6 +101,7 @@ docker compose start
 CHALLENGE_TIMEZONE: Europe/Simferopol
 CHALLENGE_START_HOUR: 10
 CHALLENGE_END_HOUR: 21
+CHALLENGES_PER_DAY: 3
 ```
 
 ## Резервная копия БД
